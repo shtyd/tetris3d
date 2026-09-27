@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>3D テトリス</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    background: #0a0a14;
+    font-family: "Hiragino Kaku Gothic ProN", "Segoe UI", sans-serif;
+    color: #eee;
+    height: 100%;
+  }
+  #canvas-wrap { position: fixed; inset: 0; }
+  #hud {
+    position: fixed; top: 14px; left: 14px;
+    background: rgba(10,10,20,0.65);
+    border: 1px solid #3a3a5a;
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    pointer-events: none;
+    min-width: 150px;
+  }
+  #hud b { color: #9ad0ff; font-size: 20px; }
+  #help {
+    position: fixed; bottom: 14px; left: 14px;
+    background: rgba(10,10,20,0.65);
+    border: 1px solid #3a3a5a;
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 12px;
+    line-height: 1.7;
+    pointer-events: none;
+    white-space: pre;
+  }
+  #next {
+    position: fixed; top: 14px; right: 14px;
+    background: rgba(10,10,20,0.65);
+    border: 1px solid #3a3a5a;
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 13px;
+    text-align: center;
+  }
+  #nextCanvas { display:block; margin-top: 6px; }
+  #overlay {
+    position: fixed; inset: 0;
+    display: none;
+    align-items: center; justify-content: center;
+    flex-direction: column;
+    background: rgba(0,0,0,0.75);
+    z-index: 10;
+  }
+  #overlay h1 { font-size: 42px; color: #ff6b6b; margin-bottom: 10px; }
+  #overlay button {
+    margin-top: 18px;
+    padding: 10px 26px;
+    font-size: 16px;
+    border-radius: 8px;
+    border: none;
+    background: #4d8dff;
+    color: white;
+    cursor: pointer;
+  }
+  #overlay button:hover { background: #6ba0ff; }
+  #startBtn {
+    position: fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background: rgba(0,0,0,0.85); z-index: 11; flex-direction: column;
+  }
+  #startBtn button {
+    padding: 14px 34px; font-size: 20px; border-radius: 10px; border: none;
+    background: #4d8dff; color: white; cursor: pointer;
+  }
+  #startBtn p { color: #aaa; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<div id="canvas-wrap"></div>
+
+<div id="hud">
+  <div>SCORE: <b id="score">0</b></div>
+  <div>LEVEL: <span id="level">1</span></div>
+  <div>LINES: <span id="lines">0</span></div>
+</div>
+
+<div id="next">
+  NEXT
+  <canvas id="nextCanvas" width="90" height="90"></canvas>
+</div>
+
+<div id="help">矢印キー: X/Z 移動
+W / S : X軸 回転
+A / D : Z軸 回転
+Q / E : Y軸 回転
+Space : ハードドロップ
+Shift : ソフトドロップ
+マウスドラッグ: 視点回転 / ホイール: ズーム</div>
+
+<div id="overlay">
+  <h1>GAME OVER</h1>
+  <div>SCORE: <span id="finalScore">0</span></div>
+  <button onclick="restartGame()">もう一度</button>
+</div>
+
+<div id="startBtn">
+  <p>3D テトリス — 落ちてくるブロックを積み上げて面を揃えよう</p>
+  <button onclick="startGame()">スタート</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- 基本設定 ----------
+const WELL_W = 5;   // X幅
+const WELL_D = 5;   // Z奥行き
+const WELL_H = 12;  // Y高さ
+
+let scene, camera, renderer;
+let wellGroup, pieceGroup, stackGroup;
+let stack = []; // stack[x][z][y] = colorHex or null
+let current = null; // {cells:[[x,y,z],...], color, origin:{x,y,z}}
+let nextType = null;
+let dropTimer = 0;
+let dropInterval = 1000;
+let score = 0, level = 1, lines = 0;
+let gameOver = false;
+let running = false;
+let cellSize = 1;
+
+// マウス操作用
+let camAngleY = Math.PI/4;
+let camAngleX = 0.5;
+let camDist = 16;
+let dragging = false, lastX=0, lastY=0;
+
+// ---------- テトロミノ形状（3D拡張：立体的な7種+α） ----------
+// 各セルは [x,y,z] のオフセット
+const SHAPES = [
+  { name:'I', color:0x4dd0ff, cells:[[0,0,0],[1,0,0],[2,0,0],[3,0,0]] },
+  { name:'O', color:0xffe14d, cells:[[0,0,0],[1,0,0],[0,0,1],[1,0,1]] },
+  { name:'T', color:0xb14dff, cells:[[0,0,0],[1,0,0],[2,0,0],[1,0,1]] },
+  { name:'L', color:0xff9d4d, cells:[[0,0,0],[0,0,1],[0,0,2],[1,0,2]] },
+  { name:'J', color:0x4d6bff, cells:[[1,0,0],[1,0,1],[1,0,2],[0,0,2]] },
+  { name:'S', color:0x4dff88, cells:[[0,0,1],[1,0,1],[1,0,0],[2,0,0]] },
+  { name:'Z', color:0xff4d6b, cells:[[0,0,0],[1,0,0],[1,0,1],[2,0,1]] },
+  // 立体ブロック
+  { name:'CUBE3D', color:0xff4dd2, cells:[[0,0,0],[1,0,0],[0,0,1],[0,1,0]] },
+];
+
+function init() {
+  const wrap = document.getElementById('canvas-wrap');
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0a14);
+  scene.fog = new THREE.Fog(0x0a0a14, 20, 45);
+
+  camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 100);
+  updateCamera();
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  wrap.appendChild(renderer.domElement);
+
+  const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+  scene.add(ambient);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir.position.set(10, 20, 10);
+  scene.add(dir);
+  const dir2 = new THREE.DirectionalLight(0x6688ff, 0.3);
+  dir2.position.set(-10, 5, -10);
+  scene.add(dir2);
+
+  wellGroup = new THREE.Group();
+  pieceGroup = new THREE.Group();
+  stackGroup = new THREE.Group();
+  scene.add(wellGroup, pieceGroup, stackGroup);
+
+  buildWell();
+
+  window.addEventListener('resize', onResize);
+  window.addEventListener('keydown', onKeyDown);
+
+  const dom = renderer.domElement;
+  dom.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+  window.addEventListener('mouseup', () => dragging = false);
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    camAngleY -= dx * 0.008;
+    camAngleX = Math.max(0.15, Math.min(1.4, camAngleX + dy * 0.006));
+    updateCamera();
+  });
+  dom.addEventListener('wheel', e => {
+    camDist = Math.max(8, Math.min(30, camDist + e.deltaY * 0.01));
+    updateCamera();
+  }, { passive: true });
+
+  animate();
+}
+
+function updateCamera() {
+  const cx = WELL_W/2 - 0.5, cz = WELL_D/2 - 0.5, cy = WELL_H/2 - 0.5;
+  camera.position.set(
+    cx + camDist * Math.sin(camAngleY) * Math.cos(camAngleX),
+    cy + camDist * Math.sin(camAngleX) + 2,
+    cz + camDist * Math.cos(camAngleY) * Math.cos(camAngleX)
+  );
+  camera.lookAt(cx, cy, cz);
+}
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function buildWell() {
+  // 床
+  const floorGeo = new THREE.PlaneGeometry(WELL_W, WELL_D);
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x1c1c30, side: THREE.DoubleSide });
+  const floor = new THREE.Mesh(floorGeo, floorMat);
+  floor.rotation.x = -Math.PI/2;
+  floor.position.set(WELL_W/2 - 0.5, -0.5, WELL_D/2 - 0.5);
+  wellGroup.add(floor);
+
+  // グリッド線（床）
+  const grid = new THREE.GridHelper(Math.max(WELL_W, WELL_D), Math.max(WELL_W, WELL_D), 0x4444aa, 0x2a2a4a);
+  grid.position.set(WELL_W/2 - 0.5, -0.499, WELL_D/2 - 0.5);
+  wellGroup.add(grid);
+
+  // 枠（ワイヤーフレームの箱）
+  const boxGeo = new THREE.BoxGeometry(WELL_W, WELL_H, WELL_D);
+  const edges = new THREE.EdgesGeometry(boxGeo);
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x5566aa });
+  const boxLines = new THREE.LineSegments(edges, lineMat);
+  boxLines.position.set(WELL_W/2 - 0.5, WELL_H/2 - 0.5, WELL_D/2 - 0.5);
+  wellGroup.add(boxLines);
+
+  // 縦の柱（4隅を強調）
+  const pillarMat = new THREE.MeshBasicMaterial({ color: 0x7788cc });
+  [[-0.5,-0.5],[WELL_W-0.5,-0.5],[-0.5,WELL_D-0.5],[WELL_W-0.5,WELL_D-0.5]].forEach(([x,z]) => {
+    const geo = new THREE.CylinderGeometry(0.04, 0.04, WELL_H, 8);
+    const m = new THREE.Mesh(geo, pillarMat);
+    m.position.set(x, WELL_H/2 - 0.5, z);
+    wellGroup.add(m);
+  });
+}
+
+function initStack() {
+  stack = [];
+  for (let x = 0; x < WELL_W; x++) {
+    stack.push([]);
+    for (let z = 0; z < WELL_D; z++) {
+      stack[x].push(new Array(WELL_H).fill(null));
+    }
+  }
+}
+
+// ---------- ピース操作 ----------
+function randomShape() {
+  return SHAPES[Math.floor(Math.random() * SHAPES.length)];
+}
+
+function spawnPiece() {
+  const shape = nextType || randomShape();
+  nextType = randomShape();
+  drawNextPreview();
+
+  // バウンディングを取って中央寄せ
+  const xs = shape.cells.map(c=>c[0]), zs = shape.cells.map(c=>c[2]), ys = shape.cells.map(c=>c[1]);
+  const w = Math.max(...xs)+1, d = Math.max(...zs)+1, h = Math.max(...ys)+1;
+  const originX = Math.floor((WELL_W - w) / 2);
+  const originZ = Math.floor((WELL_D - d) / 2);
+  const originY = WELL_H - h;
+
+  current = {
+    color: shape.color,
+    cells: shape.cells.map(c => [...c]), // ローカル座標
+    origin: { x: originX, y: originY, z: originZ },
+  };
+
+  if (!isValidPosition(current)) {
+    endGame();
+    return;
+  }
+  renderCurrentPiece();
+}
+
+function worldCells(piece) {
+  return piece.cells.map(([x,y,z]) => [
+    x + piece.origin.x,
+    y + piece.origin.y,
+    z + piece.origin.z
+  ]);
+}
+
+function isValidPosition(piece) {
+  for (const [x,y,z] of worldCells(piece)) {
+    if (x < 0 || x >= WELL_W || z < 0 || z >= WELL_D || y < 0) return false;
+    if (y < WELL_H && stack[x][z][y]) return false;
+  }
+  return true;
+}
+
+function renderCurrentPiece() {
+  pieceGroup.clear();
+  const geo = new THREE.BoxGeometry(0.94, 0.94, 0.94);
+  for (const [x,y,z] of worldCells(current)) {
+    const mat = new THREE.MeshStandardMaterial({ color: current.color, emissive: current.color, emissiveIntensity: 0.15, roughness: 0.4 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    pieceGroup.add(mesh);
+    const edges = new THREE.EdgesGeometry(geo);
+    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, transparent:true, opacity:0.3 }));
+    line.position.copy(mesh.position);
+    pieceGroup.add(line);
+  }
+}
+
+function tryMove(dx, dy, dz) {
+  if (!current || gameOver) return false;
+  const backup = { ...current.origin };
+  current.origin.x += dx;
+  current.origin.y += dy;
+  current.origin.z += dz;
+  if (!isValidPosition(current)) {
+    current.origin = backup;
+    return false;
+  }
+  renderCurrentPiece();
+  return true;
+}
+
+// 軸回転: axis = 'x'|'y'|'z', dir = 1 or -1
+function rotateCells(cells, axis, dir) {
+  return cells.map(([x,y,z]) => {
+    if (axis === 'y') return dir>0 ? [z, y, -x] : [-z, y, x];
+    if (axis === 'x') return dir>0 ? [x, -z, y] : [x, z, -y];
+    if (axis === 'z') return dir>0 ? [-y, x, z] : [y, -x, z];
+  });
+}
+
+function normalizeCells(cells) {
+  const minX = Math.min(...cells.map(c=>c[0]));
+  const minY = Math.min(...cells.map(c=>c[1]));
+  const minZ = Math.min(...cells.map(c=>c[2]));
+  return cells.map(([x,y,z]) => [x-minX, y-minY, z-minZ]);
+}
+
+function tryRotate(axis, dir) {
+  if (!current || gameOver) return;
+  const backupCells = current.cells.map(c=>[...c]);
+  const backupOrigin = { ...current.origin };
+
+  const rotated = normalizeCells(rotateCells(current.cells, axis, dir));
+  current.cells = rotated;
+
+  // 壁蹴り: 数回ずらして試す
+  const kicks = [[0,0,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[0,-1,0]];
+  let ok = false;
+  for (const [kx,ky,kz] of kicks) {
+    current.origin = { x: backupOrigin.x + kx, y: backupOrigin.y + ky, z: backupOrigin.z + kz };
+    if (isValidPosition(current)) { ok = true; break; }
+  }
+  if (!ok) {
+    current.cells = backupCells;
+    current.origin = backupOrigin;
+  } else {
+    renderCurrentPiece();
+  }
+}
+
+function lockPiece() {
+  for (const [x,y,z] of worldCells(current)) {
+    if (y >= WELL_H) { endGame(); return; }
+    stack[x][z][y] = current.color;
+  }
+  pieceGroup.clear();
+  clearLines();
+  rebuildStackMesh();
+  spawnPiece();
+}
+
+function clearLines() {
+  let cleared = 0;
+  for (let y = 0; y < WELL_H; y++) {
+    let full = true;
+    outer:
+    for (let x = 0; x < WELL_W; x++) {
+      for (let z = 0; z < WELL_D; z++) {
+        if (!stack[x][z][y]) { full = false; break outer; }
+      }
+    }
+    if (full) {
+      cleared++;
+      // 上の層を1段下げる
+      for (let yy = y; yy < WELL_H - 1; yy++) {
+        for (let x = 0; x < WELL_W; x++) {
+          for (let z = 0; z < WELL_D; z++) {
+            stack[x][z][yy] = stack[x][z][yy+1];
+          }
+        }
+      }
+      for (let x = 0; x < WELL_W; x++) {
+        for (let z = 0; z < WELL_D; z++) stack[x][z][WELL_H-1] = null;
+      }
+      y--; // 同じ高さを再チェック
+    }
+  }
+  if (cleared > 0) {
+    lines += cleared;
+    const points = [0, 100, 300, 600, 1000][cleared] || cleared * 300;
+    score += points * level;
+    level = 1 + Math.floor(lines / 10);
+    dropInterval = Math.max(150, 1000 - (level-1) * 80);
+    updateHUD();
+  }
+}
+
+function rebuildStackMesh() {
+  stackGroup.clear();
+  const geo = new THREE.BoxGeometry(0.94, 0.94, 0.94);
+  for (let x = 0; x < WELL_W; x++) {
+    for (let z = 0; z < WELL_D; z++) {
+      for (let y = 0; y < WELL_H; y++) {
+        const color = stack[x][z][y];
+        if (!color) continue;
+        const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.5 });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(x, y, z);
+        stackGroup.add(mesh);
+      }
+    }
+  }
+}
+
+function hardDrop() {
+  if (!current || gameOver) return;
+  while (tryMove(0, -1, 0)) {}
+  lockPiece();
+}
+
+// ---------- NEXT プレビュー ----------
+function drawNextPreview() {
+  const c = document.getElementById('nextCanvas');
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  if (!nextType) return;
+  const cells = nextType.cells;
+  const size = 14;
+  const xs = cells.map(c=>c[0]), zs = cells.map(c=>c[2]);
+  const minX = Math.min(...xs), minZ = Math.min(...zs);
+  const offX = 45 - (Math.max(...xs)-minX+1)*size/2;
+  const offZ = 45 - (Math.max(...zs)-minZ+1)*size/2;
+  ctx.fillStyle = '#' + nextType.color.toString(16).padStart(6,'0');
+  cells.forEach(([x,y,z]) => {
+    ctx.fillRect(offX + (x-minX)*size, offZ + (z-minZ)*size, size-2, size-2);
+  });
+}
+
+// ---------- 入力 ----------
+function onKeyDown(e) {
+  if (!running || gameOver) return;
+  switch (e.code) {
+    case 'ArrowLeft': tryMove(-1,0,0); break;
+    case 'ArrowRight': tryMove(1,0,0); break;
+    case 'ArrowUp': tryMove(0,0,-1); break;
+    case 'ArrowDown': tryMove(0,0,1); break;
+    case 'ShiftLeft':
+    case 'ShiftRight': tryMove(0,-1,0); score += 1; updateHUD(); break;
+    case 'Space': hardDrop(); e.preventDefault(); break;
+    case 'KeyQ': tryRotate('y', 1); break;
+    case 'KeyE': tryRotate('y', -1); break;
+    case 'KeyW': tryRotate('x', 1); break;
+    case 'KeyS': tryRotate('x', -1); break;
+    case 'KeyA': tryRotate('z', 1); break;
+    case 'KeyD': tryRotate('z', -1); break;
+  }
+}
+
+// ---------- HUD / ゲーム進行 ----------
+function updateHUD() {
+  document.getElementById('score').textContent = score;
+  document.getElementById('level').textContent = level;
+  document.getElementById('lines').textContent = lines;
+}
+
+function endGame() {
+  gameOver = true;
+  running = false;
+  document.getElementById('finalScore').textContent = score;
+  document.getElementById('overlay').style.display = 'flex';
+}
+
+function startGame() {
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('overlay').style.display = 'none';
+  score = 0; level = 1; lines = 0; dropInterval = 1000; gameOver = false;
+  updateHUD();
+  initStack();
+  stackGroup.clear();
+  pieceGroup.clear();
+  nextType = randomShape();
+  spawnPiece();
+  running = true;
+  lastTime = performance.now();
+}
+
+function restartGame() {
+  startGame();
+}
+
+let lastTime = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const delta = now - lastTime;
+  lastTime = now;
+
+  if (running && !gameOver) {
+    dropTimer += delta;
+    if (dropTimer >= dropInterval) {
+      dropTimer = 0;
+      if (!tryMove(0,-1,0)) {
+        lockPiece();
+      }
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+
+init();
+</script>
+</body>
+</html>
